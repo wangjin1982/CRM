@@ -28,6 +28,26 @@ from app.models.opportunity import OpportunityInfo, StageDef
 class AIService:
     """AI增强服务（当前为规则+启发式实现，后续可替换LLM）"""
 
+    ENRICH_SUPPORTED_FIELDS = {
+        "website",
+        "address",
+        "product_info",
+        "company_info",
+        "industry",
+        "source",
+        "remarks",
+    }
+
+    ENRICH_FIELD_LABELS = {
+        "website": "网址",
+        "address": "地址",
+        "product_info": "产品信息",
+        "company_info": "公司信息",
+        "industry": "行业",
+        "source": "客户来源",
+        "remarks": "备注",
+    }
+
     @staticmethod
     async def _ensure_default_config(db: AsyncSession) -> AIConfig:
         result = await db.execute(select(AIConfig).order_by(AIConfig.id.asc()).limit(1))
@@ -194,23 +214,49 @@ class AIService:
         overwrite: bool,
         user_id: int,
     ) -> Dict[str, Any]:
+        preview = await AIService.preview_customer_enrich_profile(
+            db,
+            customer_id=customer_id,
+            target_fields=target_fields,
+            overwrite=overwrite,
+            user_id=user_id,
+        )
+        proposed_updates = preview.get("proposed_updates") or {}
+        if not proposed_updates:
+            return {
+                "customer_id": preview["customer_id"],
+                "customer_name": preview["customer_name"],
+                "message": "没有可写入的补全建议",
+                "updated_fields": {},
+                "applied_count": 0,
+                "request_id": preview.get("request_id"),
+            }
+        return await AIService.apply_customer_enrich_profile(
+            db,
+            customer_id=customer_id,
+            updates=proposed_updates,
+            request_id=preview.get("request_id"),
+            user_id=user_id,
+        )
+
+    @staticmethod
+    async def preview_customer_enrich_profile(
+        db: AsyncSession,
+        *,
+        customer_id: int,
+        target_fields: Optional[List[str]],
+        overwrite: bool,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """生成客户属性补全建议（不写入业务数据）"""
         customer = (await db.execute(
             select(CustomerInfo).where(CustomerInfo.id == customer_id, CustomerInfo.deleted_at.is_(None))
         )).scalar_one_or_none()
         if not customer:
             raise ValueError("客户不存在")
 
-        supported_fields = {
-            "website",
-            "address",
-            "product_info",
-            "company_info",
-            "industry",
-            "source",
-            "remarks",
-        }
-        requested_fields = target_fields or list(supported_fields)
-        requested_fields = [f for f in requested_fields if f in supported_fields]
+        requested_fields = target_fields or list(AIService.ENRICH_SUPPORTED_FIELDS)
+        requested_fields = [f for f in requested_fields if f in AIService.ENRICH_SUPPORTED_FIELDS]
         if not requested_fields:
             raise ValueError("未指定可补全字段")
 
@@ -220,96 +266,203 @@ class AIService:
             if overwrite or current_value is None or str(current_value).strip() == "":
                 missing_fields.append(field)
 
-        if not missing_fields:
-            return {
-                "customer_id": customer.id,
-                "customer_name": customer.customer_name,
-                "message": "没有需要补全的空缺字段",
-                "updated_fields": {},
-                "skipped_fields": requested_fields,
-            }
-
-        config = await AIService._ensure_default_config(db)
-        if not config.is_enabled:
-            raise ValueError("AI配置已禁用，请先启用后重试")
-
+        suggestions: Dict[str, Any] = {}
         input_payload = {
             "customer_id": customer.id,
             "customer_name": customer.customer_name,
+            "target_fields": requested_fields,
             "missing_fields": missing_fields,
             "overwrite": overwrite,
         }
+        if missing_fields:
+            config = await AIService._ensure_default_config(db)
+            if not config.is_enabled:
+                raise ValueError("AI配置已禁用，请先启用后重试")
 
-        suggestions: Dict[str, Any] = {}
-        status = "success"
-        error_message = None
-        try:
-            provider = (config.provider or "").lower()
-            if provider in {"glm", "zhipuai"}:
-                suggestions = await AIService._call_glm_for_customer_enrich(
-                    config=config,
-                    customer=customer,
-                    target_fields=missing_fields,
+            try:
+                provider = (config.provider or "").lower()
+                if provider in {"glm", "zhipuai"}:
+                    suggestions = await AIService._call_glm_for_customer_enrich(
+                        config=config,
+                        customer=customer,
+                        target_fields=missing_fields,
+                    )
+                else:
+                    raise ValueError("当前AI提供商不是GLM，请在AI配置中设置 provider=glm")
+            except Exception as exc:
+                await AIService._log_request(
+                    db,
+                    scene="customer_enrich_preview",
+                    input_payload=input_payload,
+                    output_payload=None,
+                    status="failed",
+                    error_message=str(exc),
+                    created_by=user_id,
                 )
+                raise ValueError(f"客户补全失败: {exc}") from exc
+
+        field_status: Dict[str, Dict[str, Any]] = {}
+        proposed_updates: Dict[str, str] = {}
+        skipped_fields: List[str] = []
+        for field in requested_fields:
+            current_value = getattr(customer, field, None)
+            current_text = str(current_value).strip() if current_value is not None else ""
+            current_display = current_text if current_text else ""
+            candidate_raw = suggestions.get(field, "")
+            candidate_text = str(candidate_raw).strip() if candidate_raw is not None else ""
+            is_empty = current_text == ""
+            candidate_eligible = overwrite or is_empty
+            will_update = bool(candidate_text) and candidate_eligible
+
+            if will_update:
+                proposed_updates[field] = candidate_text
             else:
-                raise ValueError("当前AI提供商不是GLM，请在AI配置中设置 provider=glm")
-        except Exception as exc:
-            status = "failed"
-            error_message = str(exc)
+                skipped_fields.append(field)
 
-        if status == "failed":
-            await AIService._log_request(
-                db,
-                scene="customer_enrich",
-                input_payload=input_payload,
-                output_payload=None,
-                status=status,
-                error_message=error_message,
-                created_by=user_id,
-            )
-            raise ValueError(f"客户补全失败: {error_message}")
+            if not candidate_eligible and not overwrite:
+                reason = "已有值且未开启覆盖"
+            elif not candidate_text:
+                reason = "模型未返回有效建议"
+            else:
+                reason = "可写入"
 
-        updated_fields: Dict[str, str] = {}
-        for field in missing_fields:
-            value = suggestions.get(field)
-            if isinstance(value, str):
-                value = value.strip()
-            if value:
-                setattr(customer, field, value)
-                updated_fields[field] = value
-
-        if updated_fields:
-            customer.data_completed_at = datetime.utcnow()
-            company_summary = updated_fields.get("company_info") or customer.company_info
-            product_summary = updated_fields.get("product_info") or customer.product_info
-            if company_summary or product_summary:
-                customer.ai_summary = "；".join(
-                    [part for part in [company_summary, product_summary] if part]
-                )
+            field_status[field] = {
+                "field": field,
+                "label": AIService.ENRICH_FIELD_LABELS.get(field, field),
+                "current_value": current_display,
+                "is_empty": is_empty,
+                "candidate_value": candidate_text,
+                "candidate_eligible": candidate_eligible,
+                "will_update": will_update,
+                "reason": reason,
+            }
 
         output = {
             "customer_id": customer.id,
             "customer_name": customer.customer_name,
+            "target_fields": requested_fields,
             "missing_fields": missing_fields,
-            "updated_fields": updated_fields,
-            "suggestions": suggestions,
-            "applied_count": len(updated_fields),
+            "field_status": field_status,
+            "proposed_updates": proposed_updates,
+            "skipped_fields": skipped_fields,
+            "preview_count": len(proposed_updates),
         }
-
         request_log = await AIService._log_request(
             db,
-            scene="customer_enrich",
+            scene="customer_enrich_preview",
             input_payload=input_payload,
             output_payload=output,
             status="success",
             created_by=user_id,
         )
+        output["request_id"] = request_log.request_id
+        await db.flush()
+        return output
+
+    @staticmethod
+    async def apply_customer_enrich_profile(
+        db: AsyncSession,
+        *,
+        customer_id: int,
+        updates: Dict[str, Any],
+        request_id: Optional[str],
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """确认写入客户属性补全结果"""
+        customer = (await db.execute(
+            select(CustomerInfo).where(CustomerInfo.id == customer_id, CustomerInfo.deleted_at.is_(None))
+        )).scalar_one_or_none()
+        if not customer:
+            raise ValueError("客户不存在")
+
+        if request_id:
+            request_log = (await db.execute(
+                select(AIRequestLog).where(
+                    AIRequestLog.request_id == request_id,
+                    AIRequestLog.scene == "customer_enrich_preview",
+                )
+            )).scalar_one_or_none()
+            if not request_log:
+                raise ValueError("补全预览请求不存在，请重新生成建议")
+            payload = request_log.input_payload or {}
+            if int(payload.get("customer_id") or 0) != customer_id:
+                raise ValueError("补全请求与当前客户不匹配，请重新生成建议")
+
+        normalized_updates: Dict[str, str] = {}
+        for field, value in (updates or {}).items():
+            if field not in AIService.ENRICH_SUPPORTED_FIELDS:
+                continue
+            if value is None:
+                continue
+            text_value = value.strip() if isinstance(value, str) else str(value).strip()
+            if text_value:
+                normalized_updates[field] = text_value
+
+        if not normalized_updates:
+            raise ValueError("没有可确认写入的字段")
+
+        change_details: List[Dict[str, Any]] = []
+        updated_fields: Dict[str, str] = {}
+        for field, new_value in normalized_updates.items():
+            old_raw = getattr(customer, field, None)
+            old_value = str(old_raw).strip() if old_raw is not None else ""
+            if old_value == new_value:
+                continue
+            setattr(customer, field, new_value)
+            updated_fields[field] = new_value
+            change_details.append({
+                "field": field,
+                "label": AIService.ENRICH_FIELD_LABELS.get(field, field),
+                "old_value": old_value,
+                "new_value": new_value,
+            })
+
+        if not updated_fields:
+            return {
+                "customer_id": customer.id,
+                "customer_name": customer.customer_name,
+                "message": "没有发生字段变更",
+                "updated_fields": {},
+                "applied_count": 0,
+                "request_id": request_id,
+            }
+
+        customer.updated_by = user_id
+        customer.updated_at = datetime.utcnow()
+        customer.data_completed_at = datetime.utcnow()
+        company_summary = customer.company_info
+        product_summary = customer.product_info
+        if company_summary or product_summary:
+            customer.ai_summary = "；".join(
+                [part for part in [company_summary, product_summary] if part]
+            )
+
+        output = {
+            "customer_id": customer.id,
+            "customer_name": customer.customer_name,
+            "request_id": request_id,
+            "updated_fields": updated_fields,
+            "change_details": change_details,
+            "applied_count": len(updated_fields),
+        }
+        request_log = await AIService._log_request(
+            db,
+            scene="customer_enrich_apply",
+            input_payload={
+                "customer_id": customer_id,
+                "request_id": request_id,
+                "updates": normalized_updates,
+            },
+            output_payload=output,
+            status="success",
+            created_by=user_id,
+        )
         db.add(AIAnalysisResult(
-            scene="customer_enrich",
+            scene="customer_enrich_apply",
             related_type="customer",
             related_id=customer.id,
             level="info",
-            summary=f"客户属性补全完成，更新字段数：{len(updated_fields)}",
+            summary=f"客户属性确认写入完成，更新字段数：{len(updated_fields)}",
             result_data=output,
             request_log_id=request_log.id,
         ))

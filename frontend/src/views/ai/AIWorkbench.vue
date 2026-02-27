@@ -51,7 +51,7 @@
     </div>
 
     <div class="mb-4 rounded-lg bg-white p-4 shadow">
-      <h2 class="mb-2 text-lg font-semibold">客户属性智能补全</h2>
+      <h2 class="mb-2 text-lg font-semibold">客户属性智能补全（先预览后确认）</h2>
       <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
         <div>
           <label class="mb-1 block text-sm text-gray-600">搜索客户</label>
@@ -87,6 +87,7 @@
 
       <div v-if="customerLoading" class="mt-2 text-xs text-gray-500">客户列表加载中...</div>
       <div v-if="customerError" class="mt-2 text-xs text-red-600">{{ customerError }}</div>
+      <div v-if="selectedCustomerLoading" class="mt-2 text-xs text-gray-500">客户详情加载中...</div>
 
       <div class="mt-3">
         <p class="mb-2 text-sm text-gray-600">目标字段</p>
@@ -98,20 +99,130 @@
         </div>
       </div>
 
-      <div class="mt-3">
-        <button class="rounded bg-indigo-600 px-4 py-2 text-white" @click="runEnrich">开始补全</button>
+      <div v-if="selectedCustomerDetail && selectedFieldRows.length" class="mt-4 rounded border border-slate-200 bg-slate-50 p-3">
+        <p class="mb-2 text-sm font-medium text-slate-800">
+          当前客户信息：{{ selectedCustomerDetail.customer_name }}
+        </p>
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-slate-200 text-sm">
+            <thead class="bg-slate-100">
+              <tr>
+                <th class="px-3 py-2 text-left">字段</th>
+                <th class="px-3 py-2 text-left">当前值</th>
+                <th class="px-3 py-2 text-left">状态</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-200 bg-white">
+              <tr v-for="row in selectedFieldRows" :key="row.field">
+                <td class="px-3 py-2">{{ row.label }}</td>
+                <td class="px-3 py-2">
+                  <span class="line-clamp-2 break-all">{{ row.current_value || '-' }}</span>
+                </td>
+                <td class="px-3 py-2">
+                  <span
+                    class="rounded px-2 py-0.5 text-xs"
+                    :class="row.is_empty ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'"
+                  >
+                    {{ row.is_empty ? '空缺' : '已填写' }}
+                  </span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="mt-3 flex flex-wrap gap-2">
+        <button
+          class="rounded bg-indigo-600 px-4 py-2 text-white disabled:cursor-not-allowed disabled:opacity-60"
+          :disabled="previewLoading"
+          @click="runEnrichPreview"
+        >
+          {{ previewLoading ? '生成建议中...' : '开始补全（生成建议）' }}
+        </button>
+        <button
+          v-if="enrichPreview"
+          class="rounded border px-4 py-2"
+          @click="clearPreview"
+        >
+          清空建议
+        </button>
       </div>
       <p v-if="enrichError" class="mt-2 text-sm text-red-700">{{ enrichError }}</p>
       <p v-if="enrichMsg" class="mt-2 text-sm text-green-700">{{ enrichMsg }}</p>
 
-      <div v-if="enrichResult" class="mt-3 rounded border bg-gray-50 p-3 text-sm">
-        <p><span class="font-medium">客户：</span>{{ enrichResult.customer_name }}</p>
-        <p><span class="font-medium">更新字段数：</span>{{ enrichResult.applied_count || 0 }}</p>
-        <div v-if="enrichResult.updated_fields && Object.keys(enrichResult.updated_fields).length" class="mt-2">
+      <div v-if="enrichPreview" class="mt-4 rounded border border-indigo-100 bg-indigo-50 p-3 text-sm">
+        <p>
+          <span class="font-medium">预览请求ID：</span>{{ enrichPreview.request_id }}
+        </p>
+        <p>
+          <span class="font-medium">候选字段数：</span>{{ enrichPreview.preview_count || 0 }}
+        </p>
+        <div class="mt-3 overflow-x-auto">
+          <table class="min-w-full divide-y divide-indigo-100 text-sm">
+            <thead class="bg-indigo-100/60">
+              <tr>
+                <th class="px-3 py-2 text-left">确认</th>
+                <th class="px-3 py-2 text-left">字段</th>
+                <th class="px-3 py-2 text-left">当前值</th>
+                <th class="px-3 py-2 text-left">建议值（可修改）</th>
+                <th class="px-3 py-2 text-left">说明</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-indigo-100 bg-white">
+              <tr v-for="row in previewRows" :key="row.field">
+                <td class="px-3 py-2">
+                  <input
+                    v-model="acceptedMap[row.field]"
+                    type="checkbox"
+                    :disabled="!pendingUpdates[row.field]"
+                  />
+                </td>
+                <td class="px-3 py-2">{{ row.label }}</td>
+                <td class="px-3 py-2">
+                  <span class="line-clamp-2 break-all">{{ row.current_value || '-' }}</span>
+                </td>
+                <td class="px-3 py-2">
+                  <textarea
+                    v-if="isLongTextField(row.field)"
+                    v-model="pendingUpdates[row.field]"
+                    rows="3"
+                    class="w-full rounded border px-2 py-1"
+                  ></textarea>
+                  <input
+                    v-else
+                    v-model="pendingUpdates[row.field]"
+                    type="text"
+                    class="w-full rounded border px-2 py-1"
+                  />
+                </td>
+                <td class="px-3 py-2 text-xs text-slate-600">{{ row.reason }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="mt-3 flex flex-wrap gap-2">
+          <button
+            class="rounded bg-emerald-600 px-4 py-2 text-white disabled:cursor-not-allowed disabled:opacity-60"
+            :disabled="applyLoading"
+            @click="applyEnrich"
+          >
+            {{ applyLoading ? '写入中...' : '确认写入客户信息' }}
+          </button>
+          <button class="rounded border px-4 py-2" @click="selectAllSuggested">全选有建议字段</button>
+          <button class="rounded border px-4 py-2" @click="unselectAllSuggested">取消全选</button>
+        </div>
+      </div>
+
+      <div v-if="applyResult" class="mt-3 rounded border bg-emerald-50 p-3 text-sm">
+        <p><span class="font-medium">写入完成：</span>{{ applyResult.customer_name }}</p>
+        <p><span class="font-medium">更新字段数：</span>{{ applyResult.applied_count || 0 }}</p>
+        <div v-if="applyResult.change_details?.length" class="mt-2">
           <p class="font-medium">已更新字段：</p>
           <ul class="list-inside list-disc">
-            <li v-for="(value, key) in enrichResult.updated_fields" :key="String(key)">
-              {{ key }}: {{ value }}
+            <li v-for="item in applyResult.change_details" :key="`${item.field}-${item.new_value}`">
+              {{ item.label || item.field }}：`{{ item.old_value || '-' }}` -> `{{ item.new_value }}`
             </li>
           </ul>
         </div>
@@ -153,7 +264,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { aiApi, customerApi } from '@/core/api'
 
 const query = ref('')
@@ -178,10 +289,18 @@ const customerKeyword = ref('')
 const customerLoading = ref(false)
 const customerError = ref('')
 const selectedCustomerId = ref(0)
+const selectedCustomerDetail = ref<any>(null)
+const selectedCustomerLoading = ref(false)
+
 const overwrite = ref(false)
-const enrichResult = ref<any>(null)
 const enrichMsg = ref('')
 const enrichError = ref('')
+const previewLoading = ref(false)
+const applyLoading = ref(false)
+const enrichPreview = ref<any>(null)
+const applyResult = ref<any>(null)
+const pendingUpdates = ref<Record<string, string>>({})
+const acceptedMap = ref<Record<string, boolean>>({})
 const selectedFields = ref<string[]>([
   'website',
   'address',
@@ -198,6 +317,7 @@ const enrichFields = [
   { value: 'source', label: '客户来源' },
   { value: 'remarks', label: '备注' },
 ]
+const enrichFieldLabelMap = Object.fromEntries(enrichFields.map(item => [item.value, item.label]))
 
 const extractError = (error: any) => {
   if (error?.response?.data?.detail) {
@@ -207,6 +327,38 @@ const extractError = (error: any) => {
   }
   return error?.message || '请求失败'
 }
+
+const normalizeValue = (value: any) => {
+  if (value === null || value === undefined) return ''
+  return typeof value === 'string' ? value.trim() : String(value).trim()
+}
+
+const selectedFieldRows = computed(() =>
+  selectedFields.value.map((field) => {
+    const current = normalizeValue(selectedCustomerDetail.value?.[field])
+    return {
+      field,
+      label: enrichFieldLabelMap[field] || field,
+      current_value: current,
+      is_empty: !current,
+    }
+  })
+)
+
+const previewRows = computed(() => {
+  if (!enrichPreview.value?.field_status) return []
+  return selectedFields.value.map((field) => {
+    const status = enrichPreview.value.field_status[field] || {}
+    return {
+      field,
+      label: status.label || enrichFieldLabelMap[field] || field,
+      current_value: status.current_value || '',
+      reason: status.reason || '',
+    }
+  })
+})
+
+const isLongTextField = (field: string) => ['address', 'product_info', 'company_info', 'remarks'].includes(field)
 
 const loadAlerts = async () => {
   try {
@@ -238,6 +390,22 @@ const loadCustomers = async (keyword = '') => {
     customerError.value = extractError(error)
   } finally {
     customerLoading.value = false
+  }
+}
+
+const loadSelectedCustomerDetail = async () => {
+  if (!selectedCustomerId.value) {
+    selectedCustomerDetail.value = null
+    return
+  }
+  selectedCustomerLoading.value = true
+  try {
+    selectedCustomerDetail.value = await customerApi.getDetail(selectedCustomerId.value)
+  } catch (error) {
+    selectedCustomerDetail.value = null
+    enrichError.value = extractError(error)
+  } finally {
+    selectedCustomerLoading.value = false
   }
 }
 
@@ -283,10 +451,30 @@ const saveConfig = async () => {
   }
 }
 
-const runEnrich = async () => {
+const initPreviewSelection = (preview: any) => {
+  const nextPending: Record<string, string> = {}
+  const nextAccepted: Record<string, boolean> = {}
+  const fieldStatus = preview?.field_status || {}
+  for (const field of selectedFields.value) {
+    const status = fieldStatus[field] || {}
+    const candidate = normalizeValue(status.candidate_value || preview?.proposed_updates?.[field])
+    nextPending[field] = candidate
+    nextAccepted[field] = Boolean(candidate && status.will_update)
+  }
+  pendingUpdates.value = nextPending
+  acceptedMap.value = nextAccepted
+}
+
+const clearPreview = () => {
+  enrichPreview.value = null
+  pendingUpdates.value = {}
+  acceptedMap.value = {}
+}
+
+const runEnrichPreview = async () => {
   enrichMsg.value = ''
   enrichError.value = ''
-  enrichResult.value = null
+  applyResult.value = null
   if (!selectedCustomerId.value) {
     enrichError.value = '请先选择客户'
     return
@@ -295,17 +483,89 @@ const runEnrich = async () => {
     enrichError.value = '请至少选择一个补全字段'
     return
   }
+  previewLoading.value = true
   try {
-    const result = await aiApi.enrichCustomer(selectedCustomerId.value, {
+    const result = await aiApi.previewCustomerEnrich(selectedCustomerId.value, {
       target_fields: selectedFields.value,
       overwrite: overwrite.value,
     })
-    enrichResult.value = result
-    enrichMsg.value = result.message || '补全执行完成'
-    await loadCustomers()
+    enrichPreview.value = result
+    initPreviewSelection(result)
+    enrichMsg.value = result.preview_count
+      ? `已生成 ${result.preview_count} 项建议，请核对后确认写入。`
+      : '本次没有生成可写入建议（可能字段已有值或模型未返回有效内容）。'
+  } catch (error) {
+    clearPreview()
+    enrichError.value = extractError(error)
+  } finally {
+    previewLoading.value = false
+  }
+}
+
+const collectConfirmedUpdates = () => {
+  const updates: Record<string, string> = {}
+  for (const field of selectedFields.value) {
+    const accepted = !!acceptedMap.value[field]
+    const value = normalizeValue(pendingUpdates.value[field])
+    if (accepted && value) {
+      updates[field] = value
+    }
+  }
+  return updates
+}
+
+const applyEnrich = async () => {
+  enrichMsg.value = ''
+  enrichError.value = ''
+  applyResult.value = null
+  if (!selectedCustomerId.value) {
+    enrichError.value = '请先选择客户'
+    return
+  }
+  if (!enrichPreview.value?.request_id) {
+    enrichError.value = '请先生成补全建议'
+    return
+  }
+  const updates = collectConfirmedUpdates()
+  if (!Object.keys(updates).length) {
+    enrichError.value = '请至少勾选一项有效建议后再确认写入'
+    return
+  }
+  applyLoading.value = true
+  try {
+    const result = await aiApi.applyCustomerEnrich(selectedCustomerId.value, {
+      request_id: enrichPreview.value.request_id,
+      updates,
+    })
+    applyResult.value = result
+    enrichMsg.value = `已确认写入 ${result.applied_count || 0} 个字段。`
+    await Promise.all([
+      loadSelectedCustomerDetail(),
+      loadCustomers(customerKeyword.value.trim()),
+    ])
+    clearPreview()
   } catch (error) {
     enrichError.value = extractError(error)
+  } finally {
+    applyLoading.value = false
   }
+}
+
+const selectAllSuggested = () => {
+  const nextMap = { ...acceptedMap.value }
+  for (const field of selectedFields.value) {
+    const value = normalizeValue(pendingUpdates.value[field])
+    nextMap[field] = !!value
+  }
+  acceptedMap.value = nextMap
+}
+
+const unselectAllSuggested = () => {
+  const nextMap = { ...acceptedMap.value }
+  for (const field of selectedFields.value) {
+    nextMap[field] = false
+  }
+  acceptedMap.value = nextMap
 }
 
 const runQuery = async () => {
@@ -323,6 +583,19 @@ const resolve = async (id: number) => {
   await aiApi.resolveAlert(id)
   await loadAlerts()
 }
+
+watch(selectedCustomerId, async () => {
+  enrichError.value = ''
+  enrichMsg.value = ''
+  applyResult.value = null
+  clearPreview()
+  await loadSelectedCustomerDetail()
+})
+
+watch(selectedFields, () => {
+  applyResult.value = null
+  clearPreview()
+})
 
 onMounted(async () => {
   await loadConfig()

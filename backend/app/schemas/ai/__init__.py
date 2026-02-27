@@ -6,6 +6,7 @@ from .schemas import (
     AlertActionRequest,
     AIConfigUpdate,
     CustomerEnrichRequest,
+    CustomerEnrichApplyRequest,
     PromptTemplateCreate,
     PromptTemplateUpdate,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "AlertActionRequest",
     "AIConfigUpdate",
     "CustomerEnrichRequest",
+    "CustomerEnrichApplyRequest",
     "PromptTemplateCreate",
     "PromptTemplateUpdate",
 ]

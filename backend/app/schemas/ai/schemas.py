@@ -70,3 +70,10 @@ class CustomerEnrichRequest(BaseModel):
         description="目标字段列表，不传则自动识别缺失字段",
     )
     overwrite: bool = Field(default=False, description="是否覆盖已有字段")
+
+
+class CustomerEnrichApplyRequest(BaseModel):
+    """客户属性补全确认写入请求"""
+
+    request_id: Optional[str] = Field(default=None, description="补全预览请求ID")
+    updates: Dict[str, Any] = Field(default_factory=dict, description="确认写入的字段和值")

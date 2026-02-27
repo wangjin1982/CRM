@@ -9,6 +9,7 @@ from app.core.utils.response import ApiResponse
 from app.schemas.ai import (
     AIConfigUpdate,
     AlertActionRequest,
+    CustomerEnrichApplyRequest,
     CustomerEnrichRequest,
     NLQueryRequest,
     PromptTemplateCreate,
@@ -220,6 +221,48 @@ async def enrich_customer_profile(
             customer_id=customer_id,
             target_fields=payload.target_fields,
             overwrite=payload.overwrite,
+            user_id=user_id,
+        )
+        return ApiResponse.success(data=data)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/customers/{customer_id}/enrich/preview", response_model=ApiResponse)
+async def preview_customer_enrich_profile(
+    customer_id: int,
+    payload: CustomerEnrichRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    """客户属性补全预览（不写入）"""
+    try:
+        data = await AIService.preview_customer_enrich_profile(
+            db,
+            customer_id=customer_id,
+            target_fields=payload.target_fields,
+            overwrite=payload.overwrite,
+            user_id=user_id,
+        )
+        return ApiResponse.success(data=data)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/customers/{customer_id}/enrich/apply", response_model=ApiResponse)
+async def apply_customer_enrich_profile(
+    customer_id: int,
+    payload: CustomerEnrichApplyRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    """客户属性补全确认写入"""
+    try:
+        data = await AIService.apply_customer_enrich_profile(
+            db,
+            customer_id=customer_id,
+            updates=payload.updates,
+            request_id=payload.request_id,
             user_id=user_id,
         )
         return ApiResponse.success(data=data)

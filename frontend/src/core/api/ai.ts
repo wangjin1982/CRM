@@ -30,6 +30,10 @@ export const aiApi = {
   updateConfig: (data: any) => request.put('/ai/config', data),
   enrichCustomer: (customerId: number, data?: { target_fields?: string[]; overwrite?: boolean }) =>
     request.post(`/ai/customers/${customerId}/enrich`, data || {}),
+  previewCustomerEnrich: (customerId: number, data?: { target_fields?: string[]; overwrite?: boolean }) =>
+    request.post(`/ai/customers/${customerId}/enrich/preview`, data || {}),
+  applyCustomerEnrich: (customerId: number, data: { request_id?: string; updates: Record<string, any> }) =>
+    request.post(`/ai/customers/${customerId}/enrich/apply`, data),
 
   listPrompts: (scene?: string) => request.get('/ai/prompts', { params: { scene } }),
   createPrompt: (data: any) => request.post('/ai/prompts', data),

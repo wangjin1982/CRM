@@ -104,7 +104,11 @@ class CustomerResponse(CustomerBase):
     @model_validator(mode="before")
     @classmethod
     def _fill_statistics(cls, data):
-        """兼容ORM对象：自动从扁平统计字段组装statistics"""
+        """兼容ORM对象：自动从扁平统计字段组装statistics
+
+        注意：不要在这里直接修改 ORM 对象属性，避免把仅用于响应的临时转换值
+        （例如 tags:list）回写到数据库会话，导致读接口提交时报类型错误。
+        """
         def _parse_tags(value: Any) -> List[str]:
             if value is None:
                 return []
@@ -153,17 +157,24 @@ class CustomerResponse(CustomerBase):
                 }
             return data
 
-        if not hasattr(data, "statistics"):
-            stats = CustomerStatistics(
-                opportunity_count=getattr(data, "opportunity_count", 0) or 0,
-                visit_count=getattr(data, "visit_count", 0) or 0,
-                last_visit_at=getattr(data, "last_visit_at", None),
-                last_activity_at=getattr(data, "last_activity_at", None),
-            )
-            setattr(data, "statistics", stats)
-        setattr(data, "tags", _parse_tags(getattr(data, "tags", None)))
-        setattr(data, "ai_insights", _parse_ai_insights(getattr(data, "ai_insights", None)))
-        return data
+        # ORM对象转dict，避免污染session中的对象状态
+        data_dict = {}
+        for field_name in cls.model_fields.keys():
+            if field_name == "statistics":
+                continue
+            if hasattr(data, field_name):
+                data_dict[field_name] = getattr(data, field_name)
+
+        data_dict["tags"] = _parse_tags(data_dict.get("tags"))
+        data_dict["ai_insights"] = _parse_ai_insights(data_dict.get("ai_insights"))
+        if not data_dict.get("statistics"):
+            data_dict["statistics"] = {
+                "opportunity_count": getattr(data, "opportunity_count", 0) or 0,
+                "visit_count": getattr(data, "visit_count", 0) or 0,
+                "last_visit_at": getattr(data, "last_visit_at", None),
+                "last_activity_at": getattr(data, "last_activity_at", None),
+            }
+        return data_dict
 
     class Config:
         from_attributes = True

@@ -1,0 +1,52 @@
+# FastAPI框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# 数据库 (SQLite)
+sqlalchemy==2.0.25
+aiosqlite==0.19.0
+alembic==1.13.1
+greenlet==3.0.3
+
+# Redis (可选，本地开发可先跳过)
+redis==5.0.1
+
+# 认证鉴权
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+
+# 工具
+python-dotenv==1.0.0
+httpx==0.26.0
+email-validator==2.1.0
+
+# 日志
+loguru==0.7.2
+
+# 数据验证
+pydantic[email]==2.5.3
+
+# 分页
+fastapi-pagination==0.14.3
+
+# AI/LLM Integration
+zhipuai>=2.1.5
+openai>=1.12.0
+
+# 任务队列（可选）
+celery==5.3.6
+
+# 开发工具
+black==24.1.1
+ruff==0.1.14
+mypy==1.8.0
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+
+# 数据处理
+pandas==2.2.0
+openpyxl==3.1.2

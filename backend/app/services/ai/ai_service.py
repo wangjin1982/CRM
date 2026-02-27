@@ -1,0 +1,882 @@
+"""AI增强服务"""
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+import httpx
+from sqlalchemy import and_, desc, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config.settings import settings
+from app.models.activity import TaskInfo, VisitRecord
+from app.models.ai import (
+    AIAnalysisResult,
+    AIConfig,
+    AIPromptTemplate,
+    AIRequestLog,
+    AIRiskAlert,
+    AISearchHistory,
+)
+from app.models.customer import CustomerInfo, ContactInfo
+from app.models.opportunity import OpportunityInfo, StageDef
+
+
+class AIService:
+    """AI增强服务（当前为规则+启发式实现，后续可替换LLM）"""
+
+    @staticmethod
+    async def _ensure_default_config(db: AsyncSession) -> AIConfig:
+        result = await db.execute(select(AIConfig).order_by(AIConfig.id.asc()).limit(1))
+        config = result.scalar_one_or_none()
+        if config:
+            return config
+
+        config = AIConfig(
+            provider="glm",
+            model_name="glm-4-flash",
+            api_base="https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            temperature=0.3,
+            max_tokens=1500,
+            timeout_seconds=30,
+            is_enabled=True,
+            remark="默认GLM配置",
+        )
+        db.add(config)
+        await db.flush()
+        return config
+
+    @staticmethod
+    def _mask_api_key(api_key: Optional[str]) -> Optional[str]:
+        if not api_key:
+            return None
+        if len(api_key) <= 8:
+            return "*" * len(api_key)
+        return f"{api_key[:4]}{'*' * (len(api_key) - 8)}{api_key[-4:]}"
+
+    @staticmethod
+    def _extract_json_block(content: str) -> Dict[str, Any]:
+        text = (content or "").strip()
+        if not text:
+            return {}
+
+        fenced = re.search(r"```json\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+        if fenced:
+            text = fenced.group(1).strip()
+
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+            return {}
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    parsed = json.loads(text[start:end + 1])
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    return {}
+        return {}
+
+    @staticmethod
+    async def _call_glm_for_customer_enrich(
+        *,
+        config: AIConfig,
+        customer: CustomerInfo,
+        target_fields: List[str],
+    ) -> Dict[str, Any]:
+        api_key = (config.api_key or settings.ZHIPUAI_API_KEY or "").strip()
+        if not api_key:
+            raise ValueError("未配置GLM API Key")
+
+        endpoint = (config.api_base or "https://open.bigmodel.cn/api/paas/v4/chat/completions").strip()
+        model_name = (config.model_name or "glm-4-flash").strip()
+
+        existing_context = {
+            "customer_name_cn": customer.customer_name,
+            "customer_name_en": customer.customer_name_en,
+            "region": customer.region,
+            "industry": customer.industry,
+            "website": customer.website,
+            "address": customer.address,
+            "source": customer.source,
+            "company_info": customer.company_info,
+            "product_info": customer.product_info,
+            "remarks": customer.remarks,
+        }
+        field_desc = {
+            "website": "公司官网URL，必须是https://开头，无法确认时留空字符串",
+            "address": "公司地址（城市+详细地址）",
+            "product_info": "公司主营产品/方案简介（50-200字）",
+            "company_info": "公司简介（50-200字）",
+            "industry": "所属行业（例如：汽车制造/工业自动化/新能源）",
+            "source": "客户来源（例如：展会获客/存量客户/渠道推荐）",
+            "remarks": "补全备注",
+        }
+
+        target_desc = {k: field_desc.get(k, k) for k in target_fields}
+        system_prompt = (
+            "你是企业CRM数据补全助手。"
+            "根据客户名称与上下文，给出尽可能准确的企业资料补全建议。"
+            "只输出JSON对象，不要输出任何解释。"
+            "如果无法确定某字段，请返回空字符串。"
+        )
+        user_prompt = (
+            f"目标字段: {json.dumps(target_desc, ensure_ascii=False)}\n"
+            f"客户上下文: {json.dumps(existing_context, ensure_ascii=False)}\n"
+            "输出格式示例:\n"
+            "{\n"
+            '  "website": "https://example.com",\n'
+            '  "address": "上海市浦东新区xx路xx号",\n'
+            '  "product_info": "主营...",\n'
+            '  "company_info": "公司成立于...",\n'
+            '  "industry": "工业自动化",\n'
+            '  "source": "存量客户"\n'
+            "}"
+        )
+
+        payload = {
+            "model": model_name,
+            "temperature": float(config.temperature) if config.temperature is not None else 0.2,
+            "max_tokens": config.max_tokens or 1200,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+
+        timeout_seconds = config.timeout_seconds or 45
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            response_json = response.json()
+
+        content = (
+            response_json.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        parsed = AIService._extract_json_block(content)
+        if not parsed:
+            raise ValueError("GLM返回结果无法解析为JSON")
+
+        normalized: Dict[str, Any] = {}
+        for field in target_fields:
+            value = parsed.get(field)
+            if isinstance(value, str):
+                normalized[field] = value.strip()
+            elif value is None:
+                normalized[field] = ""
+            else:
+                normalized[field] = str(value).strip()
+        return normalized
+
+    @staticmethod
+    async def enrich_customer_profile(
+        db: AsyncSession,
+        *,
+        customer_id: int,
+        target_fields: Optional[List[str]],
+        overwrite: bool,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        customer = (await db.execute(
+            select(CustomerInfo).where(CustomerInfo.id == customer_id, CustomerInfo.deleted_at.is_(None))
+        )).scalar_one_or_none()
+        if not customer:
+            raise ValueError("客户不存在")
+
+        supported_fields = {
+            "website",
+            "address",
+            "product_info",
+            "company_info",
+            "industry",
+            "source",
+            "remarks",
+        }
+        requested_fields = target_fields or list(supported_fields)
+        requested_fields = [f for f in requested_fields if f in supported_fields]
+        if not requested_fields:
+            raise ValueError("未指定可补全字段")
+
+        missing_fields: List[str] = []
+        for field in requested_fields:
+            current_value = getattr(customer, field, None)
+            if overwrite or current_value is None or str(current_value).strip() == "":
+                missing_fields.append(field)
+
+        if not missing_fields:
+            return {
+                "customer_id": customer.id,
+                "customer_name": customer.customer_name,
+                "message": "没有需要补全的空缺字段",
+                "updated_fields": {},
+                "skipped_fields": requested_fields,
+            }
+
+        config = await AIService._ensure_default_config(db)
+        if not config.is_enabled:
+            raise ValueError("AI配置已禁用，请先启用后重试")
+
+        input_payload = {
+            "customer_id": customer.id,
+            "customer_name": customer.customer_name,
+            "missing_fields": missing_fields,
+            "overwrite": overwrite,
+        }
+
+        suggestions: Dict[str, Any] = {}
+        status = "success"
+        error_message = None
+        try:
+            provider = (config.provider or "").lower()
+            if provider in {"glm", "zhipuai"}:
+                suggestions = await AIService._call_glm_for_customer_enrich(
+                    config=config,
+                    customer=customer,
+                    target_fields=missing_fields,
+                )
+            else:
+                raise ValueError("当前AI提供商不是GLM，请在AI配置中设置 provider=glm")
+        except Exception as exc:
+            status = "failed"
+            error_message = str(exc)
+
+        if status == "failed":
+            await AIService._log_request(
+                db,
+                scene="customer_enrich",
+                input_payload=input_payload,
+                output_payload=None,
+                status=status,
+                error_message=error_message,
+                created_by=user_id,
+            )
+            raise ValueError(f"客户补全失败: {error_message}")
+
+        updated_fields: Dict[str, str] = {}
+        for field in missing_fields:
+            value = suggestions.get(field)
+            if isinstance(value, str):
+                value = value.strip()
+            if value:
+                setattr(customer, field, value)
+                updated_fields[field] = value
+
+        if updated_fields:
+            customer.data_completed_at = datetime.utcnow()
+            company_summary = updated_fields.get("company_info") or customer.company_info
+            product_summary = updated_fields.get("product_info") or customer.product_info
+            if company_summary or product_summary:
+                customer.ai_summary = "；".join(
+                    [part for part in [company_summary, product_summary] if part]
+                )
+
+        output = {
+            "customer_id": customer.id,
+            "customer_name": customer.customer_name,
+            "missing_fields": missing_fields,
+            "updated_fields": updated_fields,
+            "suggestions": suggestions,
+            "applied_count": len(updated_fields),
+        }
+
+        request_log = await AIService._log_request(
+            db,
+            scene="customer_enrich",
+            input_payload=input_payload,
+            output_payload=output,
+            status="success",
+            created_by=user_id,
+        )
+        db.add(AIAnalysisResult(
+            scene="customer_enrich",
+            related_type="customer",
+            related_id=customer.id,
+            level="info",
+            summary=f"客户属性补全完成，更新字段数：{len(updated_fields)}",
+            result_data=output,
+            request_log_id=request_log.id,
+        ))
+        await db.flush()
+        return output
+
+    @staticmethod
+    async def _log_request(
+        db: AsyncSession,
+        *,
+        scene: str,
+        input_payload: Dict[str, Any],
+        output_payload: Optional[Dict[str, Any]],
+        status: str = "success",
+        error_message: Optional[str] = None,
+        created_by: Optional[int] = None,
+    ) -> AIRequestLog:
+        request_log = AIRequestLog(
+            scene=scene,
+            request_id=uuid.uuid4().hex,
+            input_payload=input_payload,
+            output_payload=output_payload,
+            prompt="rule-engine",
+            model_name="rule-engine-v1",
+            status=status,
+            latency_ms=0,
+            tokens=0,
+            error_message=error_message,
+            created_by=created_by,
+        )
+        db.add(request_log)
+        await db.flush()
+        return request_log
+
+    @staticmethod
+    async def smart_complete(
+        db: AsyncSession,
+        *,
+        entity_type: str,
+        entity_id: int,
+        missing_fields: List[str],
+        context: Dict[str, Any],
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """信息智能补全（返回建议，不直接覆盖业务字段）"""
+        suggestions: Dict[str, Any] = {}
+        entity_snapshot: Dict[str, Any] = {"entity_type": entity_type, "entity_id": entity_id}
+
+        if entity_type == "customer":
+            customer = (await db.execute(
+                select(CustomerInfo).where(CustomerInfo.id == entity_id, CustomerInfo.deleted_at.is_(None))
+            )).scalar_one_or_none()
+            if not customer:
+                raise ValueError("客户不存在")
+            entity_snapshot["name"] = customer.customer_name
+
+            for field in missing_fields:
+                if field == "industry":
+                    suggestions[field] = context.get("industry") or "通用制造"
+                elif field == "level":
+                    suggestions[field] = context.get("level") or "C"
+                elif field == "source":
+                    suggestions[field] = context.get("source") or "线索导入"
+                elif field == "remarks":
+                    suggestions[field] = f"建议补充：{customer.customer_name} 的采购周期、决策链、预算信息。"
+
+        elif entity_type == "contact":
+            contact = (await db.execute(
+                select(ContactInfo).where(ContactInfo.id == entity_id, ContactInfo.deleted_at.is_(None))
+            )).scalar_one_or_none()
+            if not contact:
+                raise ValueError("联系人不存在")
+            entity_snapshot["name"] = contact.name
+            for field in missing_fields:
+                if field == "title":
+                    suggestions[field] = context.get("title") or "待确认"
+                elif field == "department":
+                    suggestions[field] = context.get("department") or "技术部"
+                elif field == "influence_level":
+                    suggestions[field] = context.get("influence_level") or 3
+
+        elif entity_type == "opportunity":
+            opportunity = (await db.execute(
+                select(OpportunityInfo).where(OpportunityInfo.id == entity_id, OpportunityInfo.deleted_at.is_(None))
+            )).scalar_one_or_none()
+            if not opportunity:
+                raise ValueError("商机不存在")
+            entity_snapshot["name"] = opportunity.opportunity_name
+            for field in missing_fields:
+                if field == "expected_close_date":
+                    suggestions[field] = str(date.today() + timedelta(days=30))
+                elif field == "win_probability":
+                    suggestions[field] = opportunity.win_probability or 50
+                elif field == "description":
+                    suggestions[field] = f"建议补充：{opportunity.opportunity_name} 的痛点、预算、决策流程。"
+        else:
+            raise ValueError(f"不支持的实体类型: {entity_type}")
+
+        output = {
+            "entity": entity_snapshot,
+            "suggestions": suggestions,
+            "completed_fields": list(suggestions.keys()),
+        }
+        request_log = await AIService._log_request(
+            db,
+            scene="smart_complete",
+            input_payload={
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "missing_fields": missing_fields,
+                "context": context,
+            },
+            output_payload=output,
+            created_by=user_id,
+        )
+
+        result = AIAnalysisResult(
+            scene="smart_complete",
+            related_type=entity_type,
+            related_id=entity_id,
+            level="info",
+            summary=f"已生成{len(suggestions)}项补全建议",
+            result_data=output,
+            request_log_id=request_log.id,
+        )
+        db.add(result)
+        await db.flush()
+        return output
+
+    @staticmethod
+    async def analyze_opportunity_risk(
+        db: AsyncSession,
+        *,
+        opportunity_id: int,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """单商机风险分析"""
+        opportunity = (await db.execute(
+            select(OpportunityInfo).where(OpportunityInfo.id == opportunity_id, OpportunityInfo.deleted_at.is_(None))
+        )).scalar_one_or_none()
+        if not opportunity:
+            raise ValueError("商机不存在")
+
+        factors: List[str] = []
+        score = 0
+
+        if (opportunity.days_in_stage or 0) >= 30:
+            factors.append("阶段停滞超过30天")
+            score += 35
+        if (opportunity.win_probability or 0) < 40:
+            factors.append("成交概率低于40%")
+            score += 25
+        if not opportunity.last_activity_at or opportunity.last_activity_at < datetime.utcnow() - timedelta(days=14):
+            factors.append("近14天无有效活动")
+            score += 20
+        if not opportunity.expected_close_date:
+            factors.append("缺少预计成交日期")
+            score += 10
+        if not opportunity.owner_id:
+            factors.append("缺少明确负责人")
+            score += 10
+
+        if score >= 70:
+            level = "high"
+        elif score >= 40:
+            level = "medium"
+        else:
+            level = "low"
+
+        suggestions = []
+        if level in {"high", "medium"}:
+            suggestions.extend([
+                "补充关键决策人信息并安排高层对齐会议",
+                "明确下一阶段门槛动作与完成时间",
+            ])
+        if "近14天无有效活动" in factors:
+            suggestions.append("3个工作日内安排一次客户跟进")
+
+        output = {
+            "opportunity_id": opportunity.id,
+            "opportunity_name": opportunity.opportunity_name,
+            "risk_level": level,
+            "risk_score": score,
+            "factors": factors,
+            "suggestions": suggestions,
+        }
+        request_log = await AIService._log_request(
+            db,
+            scene="opportunity_risk",
+            input_payload={"opportunity_id": opportunity_id},
+            output_payload=output,
+            created_by=user_id,
+        )
+
+        analysis_result = AIAnalysisResult(
+            scene="opportunity_risk",
+            related_type="opportunity",
+            related_id=opportunity.id,
+            score=score,
+            level=level,
+            summary="；".join(factors) if factors else "风险较低",
+            result_data=output,
+            request_log_id=request_log.id,
+        )
+        db.add(analysis_result)
+
+        opportunity.risk_level = level
+        opportunity.risk_factors = factors
+        opportunity.ai_suggestions = "；".join(suggestions)
+        opportunity.last_ai_analysis = datetime.utcnow()
+
+        if level in {"high", "medium"}:
+            alert = AIRiskAlert(
+                alert_type="opportunity_risk",
+                alert_level=level,
+                related_type="opportunity",
+                related_id=opportunity.id,
+                title=f"商机风险预警：{opportunity.opportunity_name}",
+                content="；".join(factors) if factors else "检测到潜在风险",
+                suggestion="；".join(suggestions) if suggestions else None,
+                status="new",
+            )
+            db.add(alert)
+
+        await db.flush()
+        return output
+
+    @staticmethod
+    async def batch_risk_scan(
+        db: AsyncSession,
+        *,
+        opportunity_ids: Optional[List[int]],
+        threshold_days: int,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """批量风险扫描"""
+        stmt = select(OpportunityInfo).where(
+            OpportunityInfo.deleted_at.is_(None),
+            OpportunityInfo.status == "open",
+        )
+        if opportunity_ids:
+            stmt = stmt.where(OpportunityInfo.id.in_(opportunity_ids))
+        opportunities = (await db.execute(stmt)).scalars().all()
+
+        scanned = 0
+        high_risk = 0
+        medium_risk = 0
+        details: List[Dict[str, Any]] = []
+
+        for opp in opportunities:
+            scanned += 1
+            result = await AIService.analyze_opportunity_risk(
+                db,
+                opportunity_id=opp.id,
+                user_id=user_id,
+            )
+            details.append(result)
+            if result["risk_level"] == "high":
+                high_risk += 1
+            elif result["risk_level"] == "medium":
+                medium_risk += 1
+
+            if (opp.days_in_stage or 0) >= threshold_days and result["risk_level"] == "low":
+                opp.risk_level = "medium"
+                opp.risk_factors = (opp.risk_factors or []) + [f"阶段停留超过阈值{threshold_days}天"]
+                medium_risk += 1
+
+        output = {
+            "scanned": scanned,
+            "high_risk": high_risk,
+            "medium_risk": medium_risk,
+            "details": details,
+        }
+        await AIService._log_request(
+            db,
+            scene="risk_batch_scan",
+            input_payload={"opportunity_ids": opportunity_ids, "threshold_days": threshold_days},
+            output_payload={k: v for k, v in output.items() if k != "details"},
+            created_by=user_id,
+        )
+        return output
+
+    @staticmethod
+    async def summarize_visit(
+        db: AsyncSession,
+        *,
+        visit_id: int,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """拜访纪要AI总结"""
+        visit = (await db.execute(
+            select(VisitRecord).where(VisitRecord.id == visit_id)
+        )).scalar_one_or_none()
+        if not visit:
+            raise ValueError("拜访记录不存在")
+
+        summary_parts = [
+            f"拜访主题：{visit.purpose or '未填写'}",
+            f"客户反馈：{visit.customer_feedback or '未填写'}",
+            f"下一步：{visit.next_plan or '建议补充明确下一步计划'}",
+        ]
+        action_items = []
+        if visit.next_plan:
+            action_items.append({"item": visit.next_plan, "owner": "销售负责人", "due_in_days": 3})
+        else:
+            action_items.append({"item": "补充拜访后的下一步行动", "owner": "销售负责人", "due_in_days": 1})
+
+        summary = "；".join(summary_parts)
+        visit.ai_summary = summary
+        visit.ai_action_items = str(action_items)
+
+        output = {
+            "visit_id": visit_id,
+            "summary": summary,
+            "action_items": action_items,
+        }
+        request_log = await AIService._log_request(
+            db,
+            scene="visit_summary",
+            input_payload={"visit_id": visit_id},
+            output_payload=output,
+            created_by=user_id,
+        )
+        db.add(AIAnalysisResult(
+            scene="visit_summary",
+            related_type="visit",
+            related_id=visit_id,
+            level="info",
+            summary=summary,
+            result_data=output,
+            request_log_id=request_log.id,
+        ))
+        await db.flush()
+        return output
+
+    @staticmethod
+    async def analyze_funnel(
+        db: AsyncSession,
+        *,
+        owner_id: Optional[int],
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """销售漏斗智能分析"""
+        stage_rows = (await db.execute(
+            select(
+                OpportunityInfo.stage_name,
+                func.count(OpportunityInfo.id),
+                func.coalesce(func.sum(OpportunityInfo.estimated_amount), 0),
+                func.avg(func.coalesce(OpportunityInfo.days_in_stage, 0)),
+            )
+            .where(
+                OpportunityInfo.deleted_at.is_(None),
+                OpportunityInfo.status == "open",
+                *( [OpportunityInfo.owner_id == owner_id] if owner_id else [] ),
+            )
+            .group_by(OpportunityInfo.stage_name)
+            .order_by(desc(func.count(OpportunityInfo.id)))
+        )).all()
+
+        stage_summary = [
+            {
+                "stage_name": row[0] or "未知阶段",
+                "count": row[1],
+                "amount": float(row[2] or 0),
+                "avg_days_in_stage": round(float(row[3] or 0), 2),
+            }
+            for row in stage_rows
+        ]
+
+        bottleneck = None
+        if stage_summary:
+            bottleneck = max(stage_summary, key=lambda x: x["avg_days_in_stage"])
+
+        insights = []
+        if bottleneck and bottleneck["avg_days_in_stage"] >= 20:
+            insights.append(f"{bottleneck['stage_name']}阶段平均停留{bottleneck['avg_days_in_stage']}天，存在明显堵点")
+        if stage_summary and stage_summary[0]["count"] > 0:
+            insights.append("建议优先处理高金额且高风险商机，提升短期转化效率")
+
+        output = {
+            "stage_summary": stage_summary,
+            "bottleneck_stage": bottleneck,
+            "insights": insights,
+        }
+        await AIService._log_request(
+            db,
+            scene="funnel_analysis",
+            input_payload={"owner_id": owner_id},
+            output_payload=output,
+            created_by=user_id,
+        )
+        return output
+
+    @staticmethod
+    async def natural_language_query(
+        db: AsyncSession,
+        *,
+        query: str,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """自然语言查询（规则解析）"""
+        normalized = query.lower()
+        intent = "unknown"
+        sql_text = ""
+        answer = "暂时无法识别该问题，请尝试询问：高风险商机、本月新增客户、待办任务。"
+        result_count = 0
+
+        if "高风险" in query and "商机" in query:
+            intent = "high_risk_opportunity"
+            sql_text = "SELECT opportunity_name FROM crm_opportunity_info WHERE risk_level='high' AND status='open'"
+            rows = (await db.execute(
+                select(OpportunityInfo.opportunity_name)
+                .where(
+                    OpportunityInfo.deleted_at.is_(None),
+                    OpportunityInfo.status == "open",
+                    OpportunityInfo.risk_level == "high",
+                )
+                .limit(10)
+            )).all()
+            names = [row[0] for row in rows]
+            result_count = len(names)
+            answer = f"当前高风险商机共{result_count}个：{', '.join(names) if names else '暂无'}"
+
+        elif "本月" in query and "新增客户" in query:
+            intent = "monthly_new_customer"
+            first_day = date.today().replace(day=1)
+            sql_text = "SELECT count(*) FROM crm_customer_info WHERE created_at >= first_day"
+            result_count = (await db.execute(
+                select(func.count(CustomerInfo.id))
+                .where(
+                    CustomerInfo.deleted_at.is_(None),
+                    func.date(CustomerInfo.created_at) >= first_day,
+                )
+            )).scalar() or 0
+            answer = f"本月新增客户 {result_count} 个。"
+
+        elif "待办" in query or "任务" in query:
+            intent = "pending_tasks"
+            sql_text = "SELECT count(*) FROM crm_task_info WHERE status in ('pending','in_progress')"
+            result_count = (await db.execute(
+                select(func.count(TaskInfo.id))
+                .where(TaskInfo.status.in_(["pending", "in_progress"]))
+            )).scalar() or 0
+            answer = f"当前待办任务 {result_count} 个。"
+
+        history = AISearchHistory(
+            query_text=query,
+            intent=intent,
+            sql_text=sql_text,
+            answer=answer,
+            result_count=result_count,
+            created_by=user_id,
+        )
+        db.add(history)
+
+        output = {
+            "intent": intent,
+            "answer": answer,
+            "result_count": result_count,
+            "sql": sql_text,
+        }
+        await AIService._log_request(
+            db,
+            scene="nl_query",
+            input_payload={"query": query},
+            output_payload=output,
+            created_by=user_id,
+        )
+        await db.flush()
+        return output
+
+    @staticmethod
+    async def list_alerts(
+        db: AsyncSession,
+        *,
+        status: Optional[str] = None,
+        level: Optional[str] = None,
+        related_type: Optional[str] = None,
+    ) -> List[AIRiskAlert]:
+        """预警列表"""
+        stmt = select(AIRiskAlert).order_by(AIRiskAlert.created_at.desc())
+        conditions = []
+        if status:
+            conditions.append(AIRiskAlert.status == status)
+        if level:
+            conditions.append(AIRiskAlert.alert_level == level)
+        if related_type:
+            conditions.append(AIRiskAlert.related_type == related_type)
+        if conditions:
+            stmt = stmt.where(and_(*conditions))
+        return list((await db.execute(stmt)).scalars().all())
+
+    @staticmethod
+    async def acknowledge_alert(
+        db: AsyncSession,
+        *,
+        alert_id: int,
+        user_id: int,
+    ) -> Optional[AIRiskAlert]:
+        """确认预警"""
+        alert = (await db.execute(select(AIRiskAlert).where(AIRiskAlert.id == alert_id))).scalar_one_or_none()
+        if not alert:
+            return None
+        alert.status = "acknowledged"
+        alert.acknowledged_by = user_id
+        alert.acknowledged_at = datetime.utcnow()
+        return alert
+
+    @staticmethod
+    async def resolve_alert(
+        db: AsyncSession,
+        *,
+        alert_id: int,
+        user_id: int,
+    ) -> Optional[AIRiskAlert]:
+        """解决预警"""
+        alert = (await db.execute(select(AIRiskAlert).where(AIRiskAlert.id == alert_id))).scalar_one_or_none()
+        if not alert:
+            return None
+        alert.status = "resolved"
+        alert.resolved_by = user_id
+        alert.resolved_at = datetime.utcnow()
+        return alert
+
+    @staticmethod
+    async def get_config(db: AsyncSession) -> AIConfig:
+        """获取AI配置"""
+        return await AIService._ensure_default_config(db)
+
+    @staticmethod
+    async def update_config(db: AsyncSession, payload: Dict[str, Any]) -> AIConfig:
+        """更新AI配置"""
+        config = await AIService._ensure_default_config(db)
+        for key, value in payload.items():
+            if key == "api_key" and isinstance(value, str):
+                value = value.strip()
+            setattr(config, key, value)
+        return config
+
+    @staticmethod
+    async def list_prompt_templates(db: AsyncSession, scene: Optional[str] = None) -> List[AIPromptTemplate]:
+        """获取提示词模板列表"""
+        stmt = select(AIPromptTemplate).order_by(AIPromptTemplate.created_at.desc())
+        if scene:
+            stmt = stmt.where(AIPromptTemplate.scene == scene)
+        return list((await db.execute(stmt)).scalars().all())
+
+    @staticmethod
+    async def create_prompt_template(db: AsyncSession, payload: Dict[str, Any]) -> AIPromptTemplate:
+        """创建提示词模板"""
+        template = AIPromptTemplate(**payload)
+        db.add(template)
+        await db.flush()
+        return template
+
+    @staticmethod
+    async def update_prompt_template(
+        db: AsyncSession,
+        template_id: int,
+        payload: Dict[str, Any],
+    ) -> Optional[AIPromptTemplate]:
+        """更新提示词模板"""
+        template = (await db.execute(
+            select(AIPromptTemplate).where(AIPromptTemplate.id == template_id)
+        )).scalar_one_or_none()
+        if not template:
+            return None
+        for key, value in payload.items():
+            setattr(template, key, value)
+        return template

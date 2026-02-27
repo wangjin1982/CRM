@@ -243,7 +243,7 @@
         <div class="mt-3 flex flex-wrap gap-2">
           <button
             class="rounded bg-emerald-600 px-4 py-2 text-white disabled:cursor-not-allowed disabled:opacity-60"
-            :disabled="applyLoading"
+            :disabled="applyLoading || confirmedCount === 0"
             @click="applyEnrich"
           >
             {{ applyLoading ? '写入中...' : '确认写入客户信息' }}
@@ -251,6 +251,9 @@
           <button class="rounded border px-4 py-2" @click="selectAllSuggested">全选有建议字段</button>
           <button class="rounded border px-4 py-2" @click="unselectAllSuggested">取消全选</button>
         </div>
+        <p class="mt-2 text-xs text-slate-600">
+          当前已选可写入字段：{{ confirmedCount }} 个
+        </p>
       </div>
 
       <div v-if="applyResult" class="mt-3 rounded border bg-emerald-50 p-3 text-sm">
@@ -412,6 +415,8 @@ const baikeInfoRows = computed(() => {
       value: info[key],
     }))
 })
+
+const confirmedCount = computed(() => Object.keys(collectConfirmedUpdates()).length)
 
 const isLongTextField = (field: string) => ['address', 'product_info', 'company_info', 'remarks'].includes(field)
 

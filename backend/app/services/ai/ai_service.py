@@ -755,13 +755,21 @@ class AIService:
             "change_details": change_details,
             "applied_count": len(updated_fields),
         }
+
+        updates_for_log: Dict[str, Any] = {}
+        for field, value in normalized_updates.items():
+            if isinstance(value, (date, datetime, Decimal)):
+                updates_for_log[field] = str(value)
+            else:
+                updates_for_log[field] = value
+
         request_log = await AIService._log_request(
             db,
             scene="customer_enrich_apply",
             input_payload={
                 "customer_id": customer_id,
                 "request_id": request_id,
-                "updates": normalized_updates,
+                "updates": updates_for_log,
             },
             output_payload=output,
             status="success",

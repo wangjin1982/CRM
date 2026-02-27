@@ -4,8 +4,11 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta
+from html import unescape
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 from sqlalchemy import and_, desc, func, select
@@ -34,6 +37,10 @@ class AIService:
         "product_info",
         "company_info",
         "industry",
+        "legal_person",
+        "registered_capital",
+        "establish_date",
+        "company_size",
         "source",
         "remarks",
     }
@@ -44,6 +51,10 @@ class AIService:
         "product_info": "产品信息",
         "company_info": "公司信息",
         "industry": "行业",
+        "legal_person": "法人代表",
+        "registered_capital": "注册资本",
+        "establish_date": "成立日期",
+        "company_size": "公司规模",
         "source": "客户来源",
         "remarks": "备注",
     }
@@ -105,11 +116,232 @@ class AIService:
         return {}
 
     @staticmethod
+    def _clean_html_text(raw: Optional[str]) -> str:
+        if not raw:
+            return ""
+        text = re.sub(r"<[^>]+>", " ", raw)
+        text = unescape(text)
+        text = text.replace("\xa0", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @staticmethod
+    def _extract_first_by_keys(info: Dict[str, str], keys: List[str]) -> str:
+        for k in keys:
+            if k in info and info[k]:
+                return info[k]
+        return ""
+
+    @staticmethod
+    def _parse_registered_capital(raw: str) -> Optional[Decimal]:
+        if not raw:
+            return None
+        text = str(raw).replace(",", "")
+        matched = re.search(r"(\d+(?:\.\d+)?)", text)
+        if not matched:
+            return None
+        value = Decimal(matched.group(1))
+        unit_factor = Decimal("1")
+        if "亿" in text:
+            unit_factor = Decimal("100000000")
+        elif "万" in text:
+            unit_factor = Decimal("10000")
+        elif "千" in text:
+            unit_factor = Decimal("1000")
+        try:
+            return value * unit_factor
+        except (InvalidOperation, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_establish_date(raw: str) -> Optional[date]:
+        if not raw:
+            return None
+        text = str(raw).strip()
+        text = text.replace("年", "-").replace("月", "-").replace("日", "")
+        text = re.sub(r"[/.]", "-", text)
+        text = re.sub(r"\s+", "", text)
+        patterns = ("%Y-%m-%d", "%Y-%m", "%Y")
+        for fmt in patterns:
+            try:
+                parsed = datetime.strptime(text, fmt)
+                if fmt == "%Y":
+                    return date(parsed.year, 1, 1)
+                if fmt == "%Y-%m":
+                    return date(parsed.year, parsed.month, 1)
+                return parsed.date()
+            except ValueError:
+                continue
+        m = re.search(r"(19|20)\d{2}-\d{1,2}-\d{1,2}", text)
+        if m:
+            try:
+                return datetime.strptime(m.group(0), "%Y-%m-%d").date()
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    async def _fetch_baike_profile(customer_name: str) -> Dict[str, Any]:
+        """优先从百度百科抓取客户资料，失败时返回空结果。"""
+        candidate_names = [customer_name.strip()]
+        if customer_name and not customer_name.endswith("公司"):
+            candidate_names.append(f"{customer_name.strip()}公司")
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+
+        for name in candidate_names:
+            url = f"https://baike.baidu.com/item/{quote(name)}"
+            try:
+                async with httpx.AsyncClient(timeout=10, headers=headers, follow_redirects=True) as client:
+                    resp = await client.get(url)
+                if resp.status_code != 200:
+                    continue
+                html = resp.text or ""
+                if not html or ("百度百科" not in html and "baike.baidu.com" not in str(resp.url)):
+                    continue
+
+                summary = ""
+                for pattern in [
+                    r'<div[^>]*class="[^"]*lemma-summary[^"]*"[^>]*>(.*?)</div>',
+                    r'<div[^>]*class="[^"]*J-summary[^"]*"[^>]*>(.*?)</div>',
+                    r'<meta\s+name="description"\s+content="([^"]+)"',
+                ]:
+                    matched = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+                    if matched:
+                        summary = AIService._clean_html_text(matched.group(1))
+                        if summary:
+                            break
+
+                basic_info: Dict[str, str] = {}
+                dt_dd_pairs = re.findall(
+                    r"<dt[^>]*>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>",
+                    html,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                for dt_raw, dd_raw in dt_dd_pairs:
+                    key = AIService._clean_html_text(dt_raw).rstrip("：:")
+                    value = AIService._clean_html_text(dd_raw)
+                    if key and value and key not in basic_info:
+                        basic_info[key] = value
+
+                if not basic_info:
+                    th_td_pairs = re.findall(
+                        r"<th[^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>",
+                        html,
+                        flags=re.IGNORECASE | re.DOTALL,
+                    )
+                    for th_raw, td_raw in th_td_pairs:
+                        key = AIService._clean_html_text(th_raw).rstrip("：:")
+                        value = AIService._clean_html_text(td_raw)
+                        if key and value and key not in basic_info:
+                            basic_info[key] = value
+
+                if not summary and not basic_info:
+                    continue
+
+                title = ""
+                title_match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    title = AIService._clean_html_text(title_match.group(1))
+
+                return {
+                    "source": "baidu_baike",
+                    "url": str(resp.url),
+                    "title": title,
+                    "summary": summary,
+                    "basic_info": basic_info,
+                }
+            except Exception:
+                continue
+        return {}
+
+    @staticmethod
+    def _map_baike_profile_to_fields(profile: Dict[str, Any]) -> Dict[str, Any]:
+        if not profile:
+            return {"suggestions": {}, "evidence": {}}
+
+        info = profile.get("basic_info") or {}
+        summary = profile.get("summary") or ""
+        suggestions: Dict[str, Any] = {}
+        evidence: Dict[str, Any] = {}
+
+        website = AIService._extract_first_by_keys(info, ["官方网站", "官网", "网站"])
+        if website:
+            suggestions["website"] = website
+
+        address = AIService._extract_first_by_keys(info, ["总部地点", "总部地址", "公司地址", "注册地址", "办公地址"])
+        if address:
+            suggestions["address"] = address
+
+        industry = AIService._extract_first_by_keys(info, ["所属行业", "行业"])
+        if industry:
+            suggestions["industry"] = industry
+
+        legal_person = AIService._extract_first_by_keys(info, ["法定代表人", "法人代表", "法人"])
+        if legal_person:
+            suggestions["legal_person"] = legal_person
+
+        company_size = AIService._extract_first_by_keys(info, ["员工人数", "员工规模", "人员规模"])
+        if company_size:
+            suggestions["company_size"] = company_size
+
+        establish = AIService._extract_first_by_keys(info, ["成立时间", "成立日期", "创立时间", "创办时间"])
+        parsed_establish = AIService._parse_establish_date(establish)
+        if parsed_establish:
+            suggestions["establish_date"] = parsed_establish
+
+        capital = AIService._extract_first_by_keys(info, ["注册资本", "注册资金"])
+        parsed_capital = AIService._parse_registered_capital(capital)
+        if parsed_capital is not None:
+            suggestions["registered_capital"] = parsed_capital
+
+        product_info = AIService._extract_first_by_keys(info, ["经营范围", "主营业务", "业务范围", "主要业务", "产品服务"])
+        if product_info:
+            suggestions["product_info"] = product_info
+
+        company_info_parts = []
+        if summary:
+            company_info_parts.append(summary)
+        for key in ["企业类型", "公司类型", "统一社会信用代码", "曾用名"]:
+            value = info.get(key)
+            if value:
+                company_info_parts.append(f"{key}：{value}")
+        if company_info_parts:
+            suggestions["company_info"] = "；".join(company_info_parts)[:1000]
+
+        if profile.get("url"):
+            suggestions["source"] = "百度百科"
+            remark_items = []
+            for key in ["企业资质", "发展历程", "历史沿革"]:
+                if info.get(key):
+                    remark_items.append(f"{key}：{info[key]}")
+            remark_text = "；".join(remark_items)
+            if remark_text:
+                suggestions["remarks"] = f"来源：百度百科 {profile['url']}；{remark_text}"[:1000]
+            else:
+                suggestions["remarks"] = f"来源：百度百科 {profile['url']}"
+
+        evidence["url"] = profile.get("url")
+        evidence["summary"] = summary
+        evidence["basic_info"] = info
+        return {
+            "suggestions": suggestions,
+            "evidence": evidence,
+        }
+
+    @staticmethod
     async def _call_glm_for_customer_enrich(
         *,
         config: AIConfig,
         customer: CustomerInfo,
         target_fields: List[str],
+        external_profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         api_key = (config.api_key or settings.ZHIPUAI_API_KEY or "").strip()
         if not api_key:
@@ -125,10 +357,15 @@ class AIService:
             "industry": customer.industry,
             "website": customer.website,
             "address": customer.address,
+            "legal_person": customer.legal_person,
+            "registered_capital": str(customer.registered_capital) if customer.registered_capital is not None else "",
+            "establish_date": str(customer.establish_date) if customer.establish_date else "",
+            "company_size": customer.company_size,
             "source": customer.source,
             "company_info": customer.company_info,
             "product_info": customer.product_info,
             "remarks": customer.remarks,
+            "external_profile": external_profile or {},
         }
         field_desc = {
             "website": "公司官网URL，必须是https://开头，无法确认时留空字符串",
@@ -136,6 +373,10 @@ class AIService:
             "product_info": "公司主营产品/方案简介（50-200字）",
             "company_info": "公司简介（50-200字）",
             "industry": "所属行业（例如：汽车制造/工业自动化/新能源）",
+            "legal_person": "法定代表人/法人姓名",
+            "registered_capital": "注册资本，输出纯数字或可解析金额，例如 5000000",
+            "establish_date": "成立日期，格式 YYYY-MM-DD",
+            "company_size": "公司规模/员工人数描述",
             "source": "客户来源（例如：展会获客/存量客户/渠道推荐）",
             "remarks": "补全备注",
         }
@@ -154,6 +395,9 @@ class AIService:
             "{\n"
             '  "website": "https://example.com",\n'
             '  "address": "上海市浦东新区xx路xx号",\n'
+            '  "legal_person": "张三",\n'
+            '  "registered_capital": "5000000",\n'
+            '  "establish_date": "2012-06-15",\n'
             '  "product_info": "主营...",\n'
             '  "company_info": "公司成立于...",\n'
             '  "industry": "工业自动化",\n'
@@ -267,6 +511,9 @@ class AIService:
                 missing_fields.append(field)
 
         suggestions: Dict[str, Any] = {}
+        baike_profile: Dict[str, Any] = {}
+        baike_suggestions: Dict[str, Any] = {}
+        llm_suggestions: Dict[str, Any] = {}
         input_payload = {
             "customer_id": customer.id,
             "customer_name": customer.customer_name,
@@ -280,14 +527,28 @@ class AIService:
                 raise ValueError("AI配置已禁用，请先启用后重试")
 
             try:
+                # 1) 优先抓取百度百科结构化信息
+                baike_profile = await AIService._fetch_baike_profile(customer.customer_name)
+                baike_result = AIService._map_baike_profile_to_fields(baike_profile)
+                baike_suggestions = baike_result.get("suggestions") or {}
+                for field in missing_fields:
+                    if field in baike_suggestions and baike_suggestions[field]:
+                        suggestions[field] = baike_suggestions[field]
+
+                # 2) 剩余字段再走GLM补齐
+                need_llm_fields = [field for field in missing_fields if not suggestions.get(field)]
                 provider = (config.provider or "").lower()
-                if provider in {"glm", "zhipuai"}:
-                    suggestions = await AIService._call_glm_for_customer_enrich(
+                if need_llm_fields and provider in {"glm", "zhipuai"}:
+                    llm_suggestions = await AIService._call_glm_for_customer_enrich(
                         config=config,
                         customer=customer,
-                        target_fields=missing_fields,
+                        target_fields=need_llm_fields,
+                        external_profile=baike_profile,
                     )
-                else:
+                    for field, value in llm_suggestions.items():
+                        if field in missing_fields and value:
+                            suggestions[field] = value
+                elif need_llm_fields:
                     raise ValueError("当前AI提供商不是GLM，请在AI配置中设置 provider=glm")
             except Exception as exc:
                 await AIService._log_request(
@@ -342,6 +603,18 @@ class AIService:
             "customer_name": customer.customer_name,
             "target_fields": requested_fields,
             "missing_fields": missing_fields,
+            "data_sources": {
+                "baidu_baike": {
+                    "matched": bool(baike_profile),
+                    "url": baike_profile.get("url"),
+                    "title": baike_profile.get("title"),
+                },
+                "glm": {
+                    "provider": "glm",
+                    "used": bool(llm_suggestions),
+                },
+            },
+            "external_profile": baike_profile,
             "field_status": field_status,
             "proposed_updates": proposed_updates,
             "skipped_fields": skipped_fields,
@@ -375,6 +648,7 @@ class AIService:
         if not customer:
             raise ValueError("客户不存在")
 
+        preview_output: Dict[str, Any] = {}
         if request_id:
             request_log = (await db.execute(
                 select(AIRequestLog).where(
@@ -387,34 +661,56 @@ class AIService:
             payload = request_log.input_payload or {}
             if int(payload.get("customer_id") or 0) != customer_id:
                 raise ValueError("补全请求与当前客户不匹配，请重新生成建议")
+            preview_output = request_log.output_payload or {}
 
-        normalized_updates: Dict[str, str] = {}
+        normalized_updates: Dict[str, Any] = {}
         for field, value in (updates or {}).items():
             if field not in AIService.ENRICH_SUPPORTED_FIELDS:
                 continue
             if value is None:
                 continue
-            text_value = value.strip() if isinstance(value, str) else str(value).strip()
-            if text_value:
-                normalized_updates[field] = text_value
+            normalized_value: Any = value
+            if isinstance(value, str):
+                normalized_value = value.strip()
+            if field == "registered_capital":
+                if isinstance(normalized_value, Decimal):
+                    pass
+                else:
+                    parsed_capital = AIService._parse_registered_capital(str(normalized_value))
+                    if parsed_capital is None:
+                        continue
+                    normalized_value = parsed_capital
+            elif field == "establish_date":
+                if isinstance(normalized_value, date):
+                    pass
+                else:
+                    parsed_date = AIService._parse_establish_date(str(normalized_value))
+                    if parsed_date is None:
+                        continue
+                    normalized_value = parsed_date
+            elif isinstance(normalized_value, str) and not normalized_value:
+                continue
+
+            normalized_updates[field] = normalized_value
 
         if not normalized_updates:
             raise ValueError("没有可确认写入的字段")
 
         change_details: List[Dict[str, Any]] = []
-        updated_fields: Dict[str, str] = {}
+        updated_fields: Dict[str, Any] = {}
         for field, new_value in normalized_updates.items():
             old_raw = getattr(customer, field, None)
             old_value = str(old_raw).strip() if old_raw is not None else ""
-            if old_value == new_value:
+            new_value_text = str(new_value).strip() if new_value is not None else ""
+            if old_value == new_value_text:
                 continue
             setattr(customer, field, new_value)
-            updated_fields[field] = new_value
+            updated_fields[field] = new_value_text
             change_details.append({
                 "field": field,
                 "label": AIService.ENRICH_FIELD_LABELS.get(field, field),
                 "old_value": old_value,
-                "new_value": new_value,
+                "new_value": new_value_text,
             })
 
         if not updated_fields:
@@ -436,6 +732,20 @@ class AIService:
             customer.ai_summary = "；".join(
                 [part for part in [company_summary, product_summary] if part]
             )
+
+        # 回填外部来源资料到 ai_insights，便于后续查看（不覆盖已有洞察）
+        external_profile = preview_output.get("external_profile") if isinstance(preview_output, dict) else None
+        if external_profile:
+            insights_obj: Dict[str, Any] = {}
+            if customer.ai_insights:
+                try:
+                    loaded = json.loads(customer.ai_insights)
+                    if isinstance(loaded, dict):
+                        insights_obj = loaded
+                except (TypeError, json.JSONDecodeError):
+                    insights_obj = {}
+            insights_obj["baidu_baike_profile"] = external_profile
+            customer.ai_insights = json.dumps(insights_obj, ensure_ascii=False)
 
         output = {
             "customer_id": customer.id,

@@ -158,6 +158,44 @@
         <p>
           <span class="font-medium">候选字段数：</span>{{ enrichPreview.preview_count || 0 }}
         </p>
+        <div class="mt-1 text-xs text-slate-600">
+          <span class="font-medium">数据来源：</span>
+          百度百科
+          <template v-if="enrichPreview.data_sources?.baidu_baike?.matched">
+            （已命中：
+            <a
+              class="text-indigo-700 underline"
+              :href="enrichPreview.data_sources.baidu_baike.url"
+              target="_blank"
+              rel="noreferrer"
+            >
+              {{ enrichPreview.data_sources.baidu_baike.url }}
+            </a>
+            ）
+          </template>
+          <template v-else>（未命中，已使用GLM补全）</template>
+        </div>
+
+        <div
+          v-if="baikeInfoRows.length || enrichPreview.external_profile?.summary"
+          class="mt-3 rounded border border-slate-200 bg-white p-3"
+        >
+          <p class="text-sm font-medium text-slate-800">百度百科提取信息</p>
+          <p v-if="enrichPreview.external_profile?.summary" class="mt-1 text-xs text-slate-700">
+            {{ enrichPreview.external_profile.summary }}
+          </p>
+          <div v-if="baikeInfoRows.length" class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+            <div
+              v-for="item in baikeInfoRows"
+              :key="item.key"
+              class="rounded border border-slate-200 px-2 py-1"
+            >
+              <p class="text-[11px] text-slate-500">{{ item.key }}</p>
+              <p class="text-xs text-slate-800 break-all">{{ item.value }}</p>
+            </div>
+          </div>
+        </div>
+
         <div class="mt-3 overflow-x-auto">
           <table class="min-w-full divide-y divide-indigo-100 text-sm">
             <thead class="bg-indigo-100/60">
@@ -307,6 +345,9 @@ const selectedFields = ref<string[]>([
   'product_info',
   'company_info',
   'industry',
+  'legal_person',
+  'registered_capital',
+  'establish_date',
 ])
 const enrichFields = [
   { value: 'website', label: '网址' },
@@ -314,6 +355,10 @@ const enrichFields = [
   { value: 'product_info', label: '产品信息' },
   { value: 'company_info', label: '公司信息' },
   { value: 'industry', label: '行业' },
+  { value: 'legal_person', label: '法人代表' },
+  { value: 'registered_capital', label: '注册资本' },
+  { value: 'establish_date', label: '成立日期' },
+  { value: 'company_size', label: '公司规模' },
   { value: 'source', label: '客户来源' },
   { value: 'remarks', label: '备注' },
 ]
@@ -356,6 +401,16 @@ const previewRows = computed(() => {
       reason: status.reason || '',
     }
   })
+})
+
+const baikeInfoRows = computed(() => {
+  const info = enrichPreview.value?.external_profile?.basic_info || {}
+  return Object.keys(info)
+    .slice(0, 16)
+    .map((key) => ({
+      key,
+      value: info[key],
+    }))
 })
 
 const isLongTextField = (field: string) => ['address', 'product_info', 'company_info', 'remarks'].includes(field)
